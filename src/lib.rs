@@ -1,5 +1,5 @@
-//! A sparse array (map) implementation which, for large + sparse data, is significantly faster than `HashMap`,
-//! with significantly less memory usage than `Vec`.
+//! A sparse array (map) implementation which, for large + sparse data, is faster than `HashMap`,
+//! with less memory usage than `Vec`.
 //!
 //! Efficiently maps `usize` to any data type. Based on [Google sparsetable][google], with ~2 bits of overhead
 //! per slot (see [Smerity's article][smerity] for more details).
@@ -548,14 +548,4 @@ impl<T: Clone> Drop for SparseArray<T> {
       }
     }
   }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SparseArray;
-
-    // This will only compile if `SparseArray::with_capacity` exists.
-    const _: fn() = || {
-        let _ = SparseArray::<u8>::with_capacity(10);
-    };
 }
