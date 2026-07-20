@@ -11,12 +11,13 @@
 //! for use cases where the array/map is created fully first, then the map can be stored and used at a later time
 //! for fast retrieval. Resizing or removal features have not been implemented yet.
 //!
-//! The `bitcode` feature flag enables encoding/decoding (for storage) using the [bitcode][bitcode] crate.
-//! For storage/portability, the array must be "packed" first, see example and docs.
+//! The `bitcode` feature flag enables encoding/decoding (for storage) using the [bitcode] crate.
+//! For storage/portability, the array must be ["packed"] first, see example and docs.
 //!
 //! [google]: https://github.com/sparsehash/sparsehash/blob/master/src/sparsehash/sparsetable
 //! [smerity]: https://smerity.com/articles/2015/google_sparsehash.html
 //! [bitcode]: https://github.com/softbearstudios/bitcode
+//! ["packed"]: SparseArray::pack
 //!
 //! # Examples
 //!
@@ -71,30 +72,29 @@ use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 #[cfg(feature = "bitcode")]
 use bitcode::{Encode, Decode};
 
-// sparse array/map based on Google sparsetable
-// https://smerity.com/articles/2015/google_sparsehash.html
-// https://github.com/sparsehash/sparsehash/blob/master/src/sparsehash/sparsetable
-
-// goal: memory efficient, fast access sparse array
-// goal: faster than hashmap, significantly less memory than vec
-
-// N = total capacity of array
-// M = number of buckets (N.div_ceil(GROUP_SIZE))
-// GROUP_SIZE = number of elements in each bucket
+// # Terminology:
+// N            = total capacity of array
+// M            = number of buckets (N.div_ceil(GROUP_SIZE))
+// `GROUP_SIZE` = number of elements in each bucket
 
 // element - each individual item in the array
 // bucket  - each group of GROUP_SIZE elements
 
-// bitmap: [usize] storing existence bits for each element
-// indices: [usize] storing index (<=> ptr) to bucket vec
-// data: Vec<Vec<T>> storing the bucket vecs (ideally would be arrays)
+// `BucketData`  : (bitmap, pointer)
+// `buckets`     : Vec<BucketData>
+// `bitmap`      : usize    - storing existence bits for each element
+// `pointer`     : usize    - storing either pointer to bucket data or index into data vec (if packed)
+// `data`        : Vec<T>   - storing raw data sequentially, only used in packed form
 
-// index is always the logical index of the element in the abstract super array
-// bm_ind is always the index of a bucket
-// bit_ind is always the index of a bit within a bucket
-// bucket_ind is always the index of a data bucket vec
-// item_ind is always the index of an element in the data bucket vec (actual, not logical)
+// in the code:
+// `index`    is always the logical index of the element in the abstract super array
+// `bm_ind`   is always the index of a bucket in `buckets`
+// `bit_ind`  is always the index of a bit within a bucket
+// `item_ind` is always the index of an element in the data bucket vec (actual, not logical)
 
+// Google implementation uses 32x + 16 for GROUP_SIZE
+// for simplicity here, using same as pointer size
+// TBD: benchmark perf diff with changes to GROUP_SIZE and update
 const GROUP_SIZE: usize = size_of::<usize>();
 
 #[derive(Clone)]
@@ -104,17 +104,32 @@ struct BucketData {
   pointer: usize
 }
 
-// N is the total logical capacity of the array
-// M is the number of buckets
+// n is the total logical capacity of the array
+// m is the number of buckets
+/// The sparse array type.
 #[cfg_attr(feature = "bitcode", derive(Encode, Decode))]
-pub struct SparseArray<T: Default + Clone> {
+pub struct SparseArray<T: Clone> {
   buckets: Vec<BucketData>,
   data: Vec<T>,
   n: usize,
-  m: usize,
 }
 
-impl<T: Default + Clone> SparseArray<T> {
+impl<T: Clone> SparseArray<T> {
+  /// Constructs new empty [`SparseArray`] with specified capacity.
+  ///
+  /// Importantly here, capacity should be based on the range of the indices being mapped rather than
+  /// the total number of elements expected to be stored in the array.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use sparse_array::SparseArray;
+  /// let mut arr: SparseArray<String> = SparseArray::with_capacity(10_000);
+  /// ```
+  ///
+  /// [`SparseArray`]: SparseArray
+  #[inline]
+  #[must_use]
   pub fn with_capacity(n: usize) -> Self {
     let m: usize = n.div_ceil(GROUP_SIZE);
 
@@ -122,7 +137,6 @@ impl<T: Default + Clone> SparseArray<T> {
       buckets: vec![BucketData { bitmap: 0, pointer: usize::MAX }; m],
       data: Vec::new(),
       n: n,
-      m: m,
     }
   }
 
@@ -146,11 +160,19 @@ impl<T: Default + Clone> SparseArray<T> {
   // no deallocations!!!
   // dst must be empty
   // src must be deallocated by caller
+  // shouldn't be overlapping
   #[inline(always)]
   fn copy_arr_vals(src: *mut T, dst: *mut T, count: usize) {
-    for i in 0..count {
+    if std::mem::needs_drop::<T>() {
+      for i in 0..count {
+        unsafe {
+          dst.add(i).write((*src.add(i)).clone());
+        }
+      }
+    }
+    else {
       unsafe {
-        dst.add(i).write((*src.add(i)).clone());
+        std::ptr::copy_nonoverlapping(src, dst, count);
       }
     }
   }
@@ -216,8 +238,20 @@ impl<T: Default + Clone> SparseArray<T> {
     bits.count_ones() as usize
   }
 
-  // public interface to check existence of element at index
-  #[inline(always)]
+  /// Checks if index is occupied in the array.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use sparse_array::SparseArray;
+  ///
+  /// let mut arr: SparseArray<u32> = SparseArray::with_capacity(10_000);
+  ///
+  /// assert_eq!(arr.has(10), false);
+  /// assert_eq!(arr.set(10, 10), true);
+  /// assert_eq!(arr.has(10), true);
+  /// ```
+  #[inline]
   pub fn has(&self, index: usize) -> bool {
     if index >= self.n {
       return false;
@@ -230,8 +264,34 @@ impl<T: Default + Clone> SparseArray<T> {
     SparseArray::<T>::is_set(bitmap, bit_ind)
   }
 
-  // set the value of an element
-  #[inline(always)]
+  /// Set the value at an index. Can't be used if array is in [packed] form.
+  ///
+  /// Returns `true` if succeeded, `false` if index is not valid or if array is in [packed] form.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use sparse_array::SparseArray;
+  ///
+  /// let mut arr: SparseArray<u32> = SparseArray::with_capacity(1_000);
+  ///
+  /// assert_eq!(arr.set(10, 10), true);
+  /// assert_eq!(arr.get(10), Some(&10));
+  ///
+  /// assert_eq!(arr.set(2000, 20), false);
+  ///
+  /// // can be used to change a value
+  /// assert_eq!(arr.set(10, 11), true);
+  /// assert_eq!(arr.get(10), Some(&11));
+  ///
+  /// arr.pack();
+  ///
+  /// // fails when in packed form
+  /// assert_eq!(arr.set(15, 15), false);
+  /// ```
+  ///
+  /// [packed]: SparseArray::pack
+  #[inline]
   pub fn set(&mut self, index: usize, value: T) -> bool {
     if index >= self.n || self.data.capacity() > 0 {
       return false;
@@ -293,8 +353,23 @@ impl<T: Default + Clone> SparseArray<T> {
     Some((bucket.pointer, item_ind))
   }
 
-  // get the reference of an element
-  #[inline(always)]
+  /// Returns a reference to element if it exists in the array.
+  ///
+  /// Returns `None` if out of bounds or no value set for the index.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use sparse_array::SparseArray;
+  ///
+  /// let mut arr: SparseArray<String> = SparseArray::with_capacity(10_000);
+  ///
+  /// arr.set(10, String::from("ten"));
+  /// assert_eq!(arr.get(10).unwrap(), "ten");
+  ///
+  /// assert_eq!(arr.get(15), None);
+  /// ```
+  #[inline]
   pub fn get(&mut self, index: usize) -> Option<&T> {
     match self._get(index) {
       None => {
@@ -310,8 +385,26 @@ impl<T: Default + Clone> SparseArray<T> {
     }
   }
 
-  // get the mutable reference of an element
-  #[inline(always)]
+  /// Returns a mutable reference to element if it exists in the array.
+  ///
+  /// Returns `None` if out of bounds or no value set for the index.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use sparse_array::SparseArray;
+  ///
+  /// let mut arr: SparseArray<String> = SparseArray::with_capacity(10_000);
+  ///
+  /// arr.set(10, String::from("ten"));
+  /// assert_eq!(arr.get_mut(10).unwrap(), "ten");
+  ///
+  /// assert_eq!(arr.get_mut(15), None);
+  ///
+  /// arr.get_mut(10).unwrap().push_str(" ten");
+  /// assert_eq!(arr.get(10).unwrap(), "ten ten");
+  /// ```
+  #[inline]
   pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
     match self._get(index) {
       None => {
@@ -330,8 +423,44 @@ impl<T: Default + Clone> SparseArray<T> {
   // pack the sparse array into portable format
   // move bucket data vecs sequentially into `data`
   // bucket data pointers changed to indices into `data` vec
+
+  /// Packs the data allocations into the struct for portability.
+  ///
+  /// When packed, insertions would be significantly more expensive, so they are disallowed.
+  /// The array can be [unpacked] to re-enable insertions.
+  /// Intended to allow encoding and storage in the packed form. With the `bitcode` feature enabled,
+  /// the `SparseArray` can be encoded with the [`bitcode`] crate.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use sparse_array::SparseArray;
+  ///
+  /// let mut arr: SparseArray<String> = SparseArray::with_capacity(10_000);
+  /// arr.set(5000, String::from("hello world"));
+  ///
+  /// arr.pack();
+  ///
+  /// // now SparseArray can be safely encoded and stored
+  /// // let encoded: Vec<u8> = bitcode::encode(&arr);
+  /// // [write encoded to file]
+  /// // [read encoded from file]
+  /// // let mut decoded: SparseArray<String> = bitcode::decode(&encoded).unwrap();
+  ///
+  /// // has() and get() still work as expected
+  /// assert_eq!(arr.has(5000), true);
+  /// arr.get_mut(5000).unwrap().push_str("!");
+  /// assert_eq!(arr.get(5000).unwrap(), "hello world!");
+  ///
+  /// // can't use set() on packed array
+  /// assert_eq!(arr.set(0, String::from("fails")), false);
+  /// ```
+  ///
+  /// [unpacked]: SparseArray::unpack
+  /// [`bitcode`]: https://github.com/softbearstudios/bitcode
+  #[inline]
   pub fn pack(&mut self) {
-    for i in 0..self.m {
+    for i in 0..self.buckets.len() {
       let ind = self.data.len();
       let bucket = &mut self.buckets[i];
 
@@ -355,8 +484,40 @@ impl<T: Default + Clone> SparseArray<T> {
   }
 
   // unflatten data for more efficient insertion
+
+  /// Unpacks the struct into data allocations which are more efficient for insertion.
+  ///
+  /// The goal of [packing] is to allow portability before the array/map is used. Generally, it is
+  /// better to create and modify the map fully before packing, as unpacking adds the cost of allocating
+  /// and copying values.
+  ///
+  /// # Examples
+  ///
+  /// ```rust
+  /// use sparse_array::SparseArray;
+  ///
+  /// let mut arr: SparseArray<String> = SparseArray::with_capacity(10_000);
+  /// arr.set(5000, String::from("hello world"));
+  ///
+  /// arr.pack();
+  ///
+  /// // now SparseArray can be safely encoded and stored
+  /// // let encoded: Vec<u8> = bitcode::encode(&arr);
+  /// // [write encoded to file]
+  /// // [read encoded from file]
+  /// // let mut decoded: SparseArray<String> = bitcode::decode(&encoded).unwrap();
+  /// // decoded.unpack();
+  ///
+  /// arr.unpack();
+  ///
+  /// // all array methods work as expected
+  /// assert_eq!(arr.set(0, String::from("works")), true);
+  /// ```
+  ///
+  /// [packing]: SparseArray::pack
+  #[inline]
   pub fn unpack(&mut self) {
-    for i in 0..self.m {
+    for i in 0..self.buckets.len() {
       let bucket = &mut self.buckets[i];
 
       if bucket.pointer != usize::MAX {
@@ -374,7 +535,8 @@ impl<T: Default + Clone> SparseArray<T> {
   }
 }
 
-impl<T: Default + Clone> Drop for SparseArray<T> {
+impl<T: Clone> Drop for SparseArray<T> {
+  // need to free every allocation
   fn drop(&mut self) {
     if self.data.capacity() == 0 {
       for bucket in &self.buckets {
@@ -386,4 +548,14 @@ impl<T: Default + Clone> Drop for SparseArray<T> {
       }
     }
   }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SparseArray;
+
+    // This will only compile if `SparseArray::with_capacity` exists.
+    const _: fn() = || {
+        let _ = SparseArray::<u8>::with_capacity(10);
+    };
 }
