@@ -180,6 +180,7 @@ impl<T: Clone> SparseArray<T> {
         }
       }
     }
+    // if type allows copying, directly memcpy values
     else {
       unsafe {
         std::ptr::copy_nonoverlapping(src, dst, count);
