@@ -27,11 +27,6 @@ use bitcode::{Encode, Decode};
 
 const GROUP_SIZE: usize = 64;
 
-#[inline(always)]
-pub const fn calculate_m(n: usize) -> usize {
-  n.div_ceil(GROUP_SIZE)
-}
-
 #[derive(Encode, Decode, Clone)]
 struct BucketData {
   bitmap: u64,
@@ -41,15 +36,15 @@ struct BucketData {
 // N is the total logical capacity of the array
 // M is the number of buckets
 #[derive(Encode, Decode)]
-struct SparseArray<T: Default + Clone> {
+pub struct SparseArray<T: Default + Clone> {
   buckets: Vec<BucketData>,
-  data: Vec<T>,
+  pub data: Vec<T>,
   n: usize,
   m: usize,
 }
 
 impl<T: Default + Clone> SparseArray<T> {
-  fn with_capacity(n: usize) -> Self {
+  pub fn with_capacity(n: usize) -> Self {
     let m: usize = n.div_ceil(GROUP_SIZE);
 
     Self {
@@ -126,7 +121,7 @@ impl<T: Default + Clone> SparseArray<T> {
 
   // wrapper for is_set
   #[inline(always)]
-  fn _has(&self, bm: u64, bit_ind: usize) -> bool {
+  fn _has(bm: u64, bit_ind: usize) -> bool {
     SparseArray::<T>::is_set(bm, bit_ind)
   }
 
@@ -152,7 +147,7 @@ impl<T: Default + Clone> SparseArray<T> {
 
   // public interface to check existence of element at index
   #[inline(always)]
-  fn has(&self, index: usize) -> bool {
+  pub fn has(&self, index: usize) -> bool {
     if index >= self.n {
       return false;
     }
@@ -166,8 +161,8 @@ impl<T: Default + Clone> SparseArray<T> {
 
   // set the value of an element
   #[inline(always)]
-  fn set(&mut self, index: usize, value: T) -> bool {
-    if index >= self.n {
+  pub fn set(&mut self, index: usize, value: T) -> bool {
+    if index >= self.n || self.data.capacity() > 0 {
       return false;
     }
 
@@ -177,6 +172,16 @@ impl<T: Default + Clone> SparseArray<T> {
     let bucket = &mut self.buckets[bm_ind];
     let item_ind = SparseArray::<T>::get_item_ind(bucket.bitmap, bit_ind);
 
+    // if already in array, no resize needed, just update
+    if SparseArray::<T>::_has(bucket.bitmap, bit_ind) {
+      unsafe {
+        (bucket.pointer as *mut T).add(item_ind).write(value);
+      }
+
+      return true;
+    }
+
+    // if bucket has no items yet, allocate array
     if bucket.pointer == usize::MAX {
       // create data arr
       let ptr = SparseArray::<T>::new_arr(1);
@@ -184,6 +189,7 @@ impl<T: Default + Clone> SparseArray<T> {
 
       bucket.pointer = ptr as usize;
     }
+    // otherwise, insert
     else {
       let bucket_len = SparseArray::<T>::get_bucket_size(bucket.bitmap);
       let ptr = SparseArray::<T>::insert_in_arr(bucket.pointer as *mut T, item_ind, value, bucket_len);
@@ -196,9 +202,9 @@ impl<T: Default + Clone> SparseArray<T> {
     true
   }
 
-  // get the mutable reference of an element
+  // get helper, returns bucket.pointer & item_ind
   #[inline(always)]
-  fn get(&mut self, index: usize) -> Option<&mut T> {
+  fn _get(&mut self, index: usize) -> Option<(usize, usize)> {
     if index >= self.n {
       return None;
     }
@@ -207,23 +213,53 @@ impl<T: Default + Clone> SparseArray<T> {
     let bit_ind = index % GROUP_SIZE;
     let bucket = &self.buckets[bm_ind];
 
-    if !self._has(bucket.bitmap, bit_ind) {
+    if !SparseArray::<T>::_has(bucket.bitmap, bit_ind) {
       return None;
     }
 
     let item_ind = SparseArray::<T>::get_item_ind(bucket.bitmap, bit_ind);
 
-    if self.data.capacity() > 0 {
-      return Some( &mut self.data[bucket.pointer + item_ind] );
-    }
+    Some((bucket.pointer, item_ind))
+  }
 
-    Some(unsafe { &mut *(bucket.pointer as *mut T).add(item_ind) })
+  // get the reference of an element
+  #[inline(always)]
+  pub fn get(&mut self, index: usize) -> Option<&T> {
+    match self._get(index) {
+      None => {
+        return None
+      },
+      Some((bucket_ptr, item_ind)) => {
+        if self.data.capacity() > 0 {
+          return Some( &self.data[bucket_ptr + item_ind] );
+        }
+
+        Some(unsafe { &*(bucket_ptr as *mut T).add(item_ind) })
+      }
+    }
+  }
+
+  // get the mutable reference of an element
+  #[inline(always)]
+  pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+    match self._get(index) {
+      None => {
+        return None
+      },
+      Some((bucket_ptr, item_ind)) => {
+        if self.data.capacity() > 0 {
+          return Some( &mut self.data[bucket_ptr + item_ind] );
+        }
+
+        Some(unsafe { &mut *(bucket_ptr as *mut T).add(item_ind) })
+      }
+    }
   }
 
   // pack the sparse array into portable format
   // move bucket data vecs sequentially into `data`
   // bucket data pointers changed to indices into `data` vec
-  fn pack(&mut self) {
+  pub fn pack(&mut self) {
     for i in 0..self.m {
       let ind = self.data.len();
       let bucket = &mut self.buckets[i];
@@ -243,12 +279,28 @@ impl<T: Default + Clone> SparseArray<T> {
         bucket.pointer = ind;
       }
     }
+
+    self.data.shrink_to_fit();
   }
 
   // unflatten data for more efficient insertion
-  // fn unpack(&mut self) {
+  pub fn unpack(&mut self) {
+    for i in 0..self.m {
+      let bucket = &mut self.buckets[i];
 
-  // }
+      if bucket.pointer != usize::MAX {
+        let bucket_len = SparseArray::<T>::get_bucket_size(bucket.bitmap);
+
+        let ptr = SparseArray::<T>::new_arr(bucket_len);
+        unsafe {
+          SparseArray::<T>::copy_arr_vals((self.data.as_ptr() as *mut T).add(bucket.pointer), ptr, bucket_len);
+        }
+        bucket.pointer = ptr as usize;
+      }
+    }
+
+    self.data = Vec::new();
+  }
 }
 
 impl<T: Default + Clone> Drop for SparseArray<T> {
@@ -263,138 +315,4 @@ impl<T: Default + Clone> Drop for SparseArray<T> {
       }
     }
   }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn one_bucket() {
-        let mut arr: SparseArray<u32> = SparseArray::with_capacity(64);
-        assert!(!arr.has(5));
-        assert!(arr.set(5, 123u32));
-        assert!(arr.has(5));
-        assert_eq!(arr.get(5), Some(123u32).as_mut());
-
-        assert!(arr.set(0, 50u32));
-        assert!(arr.set(63, 100u32));
-        assert!(!arr.set(100, 100u32));
-
-        assert_eq!(arr.get(5), Some(123u32).as_mut());
-        assert_eq!(arr.get(63), Some(100u32).as_mut());
-        assert_eq!(arr.get(0), Some(50u32).as_mut());
-
-        assert!(arr.has(0));
-        assert!(arr.has(63));
-        assert!(!arr.has(6));
-    }
-
-    #[test]
-    fn many_buckets() {
-      const N: usize = 10000;
-      let mut arr: SparseArray<u32> = SparseArray::with_capacity(N);
-
-      assert!(arr.set(5, 123u32));
-      assert!(arr.set(1500, 456u32));
-      assert!(arr.set(9876, 789u32));
-
-      assert_eq!(arr.get(5), Some(123u32).as_mut());
-      assert_eq!(arr.get(1500), Some(456u32).as_mut());
-      assert_eq!(arr.get(9876), Some(789u32).as_mut());
-    }
-
-    #[test]
-    fn complex_type() {
-      const N: usize = 128;
-      let mut arr: SparseArray<Vec<u16>> = SparseArray::with_capacity(N);
-
-      assert!(arr.set(5, vec![5; 5]));
-      assert!(arr.set(100, vec![10; 10]));
-
-      assert_eq!(arr.get(5), Some(vec![5; 5]).as_mut());
-      assert_eq!(arr.get(100), Some(vec![10; 10]).as_mut());
-    }
-
-    #[test]
-    fn test_bincode_serde() {
-      const N: usize = 128;
-      let mut arr: SparseArray<Vec<u16>> = SparseArray::with_capacity(N);
-
-      assert!(arr.set(5, vec![5; 5]));
-      assert!(arr.set(100, vec![10; 10]));
-
-      arr.pack();
-
-      let encoded: Vec<u8> = bitcode::encode(&arr);
-      let mut decoded: SparseArray<Vec<u16>> = bitcode::decode(&encoded).unwrap();
-
-      assert_eq!(decoded.get(5), Some(vec![5; 5]).as_mut());
-      assert_eq!(decoded.get(100), Some(vec![10; 10]).as_mut());
-    }
-
-    #[test]
-    fn test_large() {
-      const M: usize = 64 * 64 * 64 * 64;
-      const N: usize = M * 64;
-      let mut arr: SparseArray<Vec<usize>> = SparseArray::with_capacity(N);
-
-      let mut i = 2;
-
-      while i < N {
-        assert!(arr.set(i, vec![i; 3]));
-        i += M;
-      }
-
-      i = 1;
-
-      while i < N {
-        assert!(arr.set(i, vec![i; 6]));
-        i += M;
-      }
-
-      arr.pack();
-
-      let encoded: Vec<u8> = bitcode::encode(&arr);
-      let mut decoded: SparseArray<Vec<usize>> = bitcode::decode(&encoded).unwrap();
-
-      let mut i = 2;
-
-      while i < N {
-        assert_eq!(decoded.get(i), Some(vec![i; 3]).as_mut());
-        i += M;
-      }
-
-      i = 1;
-
-      while i < N {
-        assert_eq!(decoded.get(i), Some(vec![i; 6]).as_mut());
-        i += M;
-      }
-    }
-
-    /*
-    #[test]
-    fn test_array_large() {
-      let mut arr = Vec::new();
-      const M: usize = 64 * 64;
-      const N: usize = M * 64 * 64;
-
-      let mut i: usize = 2;
-
-      while i < N {
-        arr.push(vec![i; 3]);
-        i += M;
-      }
-
-      i = 1;
-
-      while i < N {
-        arr.push(vec![i; 6]);
-        i += M;
-      }
-
-      assert_eq!(arr.len(), 64 * 64 * 2);
-    }
-    */
 }

@@ -5,3 +5,18 @@ edition = "2024"
 
 [dependencies]
 bitcode = "0.6.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "vs_hashmap"
+harness = false
+
+[[bench]]
+name = "vs_vec"
+harness = false
