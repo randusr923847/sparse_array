@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
 description = "Array/Map for large & sparse data"
 readme = "README.md"
 repository = "https://github.com/randusr923847/sparse_array"
+categories = ["data-structures"]
+keywords = ["sparse", "array"]
 
 [dependencies]
 bitcode = { version = "0.6.9", optional = true }

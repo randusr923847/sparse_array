@@ -97,7 +97,7 @@ use bitcode::{Encode, Decode};
 // TBD: benchmark perf diff with changes to GROUP_SIZE and update
 const GROUP_SIZE: usize = size_of::<usize>();
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "bitcode", derive(Encode, Decode))]
 struct BucketData {
   bitmap: usize,
@@ -107,6 +107,7 @@ struct BucketData {
 // n is the total logical capacity of the array
 // m is the number of buckets
 /// The sparse array type.
+#[derive(Debug)]
 #[cfg_attr(feature = "bitcode", derive(Encode, Decode))]
 pub struct SparseArray<T: Clone> {
   buckets: Vec<BucketData>,
@@ -115,6 +116,15 @@ pub struct SparseArray<T: Clone> {
 }
 
 impl<T: Clone> SparseArray<T> {
+  /// Identical to [`with_capacity`], see below.
+  ///
+  /// [`with_capacity`]: SparseArray::with_capacity
+  #[inline]
+  #[must_use]
+  pub fn new(n: usize) -> Self {
+    SparseArray::<T>::with_capacity(n)
+  }
+
   /// Constructs new empty [`SparseArray`] with specified capacity.
   ///
   /// Importantly here, capacity should be based on the range of the indices being mapped rather than
