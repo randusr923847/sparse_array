@@ -84,11 +84,13 @@ fn test_bitcode_pack() {
   let mut arr: SparseArray<Vec<u16>> = SparseArray::with_capacity(N);
 
   assert!(arr.set(5, vec![5; 5]));
+  assert!(arr.set(64, vec![7; 7]));
   assert!(arr.set(100, vec![10; 10]));
 
   arr.pack();
 
   assert_eq!(arr.get(5), Some(vec![5; 5]).as_ref());
+  assert_eq!(arr.get(64), Some(vec![7; 7]).as_ref());
   assert_eq!(arr.get(100), Some(vec![10; 10]).as_ref());
 
   let encoded: Vec<u8> = bitcode::encode(&arr);

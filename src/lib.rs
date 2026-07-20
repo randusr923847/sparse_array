@@ -1,4 +1,74 @@
+//! A sparse array (map) implementation which, for large + sparse data, is significantly faster than `HashMap`,
+//! with significantly less memory usage than `Vec`.
+//!
+//! Efficiently maps `usize` to any data type. Based on [Google sparsetable][google], with ~2 bits of overhead
+//! per slot (see [Smerity's article][smerity] for more details).
+//!
+//! This data structure is most appropriate when the range of indices is large, only a small percentage of those
+//! indices are used/occupied, and the indices which are used are spread out within the range of indices.
+//!
+//! The capacity (range of indices) must be set at constructor time. Currently, this implementation is designed
+//! for use cases where the array/map is created fully first, then the map can be stored and used at a later time
+//! for fast retrieval. Resizing or removal features have not been implemented yet.
+//!
+//! The `bitcode` feature flag enables encoding/decoding (for storage) using the [bitcode][bitcode] crate.
+//! For storage/portability, the array must be "packed" first, see example and docs.
+//!
+//! [google]: https://github.com/sparsehash/sparsehash/blob/master/src/sparsehash/sparsetable
+//! [smerity]: https://smerity.com/articles/2015/google_sparsehash.html
+//! [bitcode]: https://github.com/softbearstudios/bitcode
+//!
+//! # Examples
+//!
+//! ```rust
+//! use sparse_array::SparseArray;
+//!
+//! let n = 10_000;
+//! let mut arr: SparseArray<String> = SparseArray::with_capacity(n);
+//!
+//! arr.set(5, String::from("five"));
+//! arr.set(1234, String::from("one thousand two hundred thirty four"));
+//! arr.set(9999, String::from("nine thousand nine hundred ninety nine"));
+//!
+//! let success = arr.set(20000, String::from("should fail"));
+//! assert_eq!(success, false);
+//!
+//! assert!(arr.has(1234));
+//! assert!(!arr.has(2000));
+//!
+//! assert_eq!(arr.get(5).unwrap(), "five");
+//! assert_eq!(arr.get(6), None);
+//!
+//! arr.get_mut(5).unwrap().push_str("!");
+//! assert_eq!(arr.get(5).unwrap(), "five!");
+//!
+//! // pack the array into portable format for encoding & storage
+//! // when in packed form, no new insertions can be made (for performance)
+//! arr.pack();
+//!
+//! assert_eq!(arr.get(1234).unwrap(), "one thousand two hundred thirty four");
+//!
+//! // set() cannot be used in packed form
+//! assert_eq!(arr.set(6, String::from("six")), false);
+//!
+//! // existing elements can be modified using get_mut()
+//! let s = arr.get_mut(5).unwrap();
+//! s.clear();
+//! s.push_str("5");
+//!
+//! assert_eq!(arr.get(5).unwrap(), "5");
+//!
+//! // the array can be unpacked to restore insertion ability
+//! arr.unpack();
+//!
+//! assert_eq!(arr.set(6, String::from("six")), true);
+//! assert_eq!(arr.get(6).unwrap(), "six");
+//! ```
+
+use std::mem::size_of;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
+
+#[cfg(feature = "bitcode")]
 use bitcode::{Encode, Decode};
 
 // sparse array/map based on Google sparsetable
@@ -15,7 +85,7 @@ use bitcode::{Encode, Decode};
 // element - each individual item in the array
 // bucket  - each group of GROUP_SIZE elements
 
-// bitmap: [u64] storing existence bits for each element
+// bitmap: [usize] storing existence bits for each element
 // indices: [usize] storing index (<=> ptr) to bucket vec
 // data: Vec<Vec<T>> storing the bucket vecs (ideally would be arrays)
 
@@ -25,20 +95,21 @@ use bitcode::{Encode, Decode};
 // bucket_ind is always the index of a data bucket vec
 // item_ind is always the index of an element in the data bucket vec (actual, not logical)
 
-const GROUP_SIZE: usize = 64;
+const GROUP_SIZE: usize = size_of::<usize>();
 
-#[derive(Encode, Decode, Clone)]
+#[derive(Clone)]
+#[cfg_attr(feature = "bitcode", derive(Encode, Decode))]
 struct BucketData {
-  bitmap: u64,
+  bitmap: usize,
   pointer: usize
 }
 
 // N is the total logical capacity of the array
 // M is the number of buckets
-#[derive(Encode, Decode)]
+#[cfg_attr(feature = "bitcode", derive(Encode, Decode))]
 pub struct SparseArray<T: Default + Clone> {
   buckets: Vec<BucketData>,
-  pub data: Vec<T>,
+  data: Vec<T>,
   n: usize,
   m: usize,
 }
@@ -107,33 +178,33 @@ impl<T: Default + Clone> SparseArray<T> {
   // bm_ind is the index of the bucket in the bitmap
   // bit_ind is the index of the bit within that bucket
   #[inline(always)]
-  fn is_set(bm: u64, bit_ind: usize) -> bool {
-    let mask: u64 = 1 << (GROUP_SIZE - 1 - bit_ind);
+  fn is_set(bm: usize, bit_ind: usize) -> bool {
+    let mask: usize = 1 << (GROUP_SIZE - 1 - bit_ind);
     mask & bm > 0
   }
 
   // set bit in bitmap to 1
   #[inline(always)]
   fn set_bit(&mut self, bm_ind: usize, bit_ind: usize) {
-    let mask: u64 = 1 << (GROUP_SIZE - 1 - bit_ind);
+    let mask: usize = 1 << (GROUP_SIZE - 1 - bit_ind);
     self.buckets[bm_ind].bitmap = self.buckets[bm_ind].bitmap | mask;
   }
 
   // wrapper for is_set
   #[inline(always)]
-  fn _has(bm: u64, bit_ind: usize) -> bool {
+  fn _has(bm: usize, bit_ind: usize) -> bool {
     SparseArray::<T>::is_set(bm, bit_ind)
   }
 
   // returns bucket size, counts ones in bucket bitmap
   #[inline(always)]
-  fn get_bucket_size(bm: u64) -> usize {
+  fn get_bucket_size(bm: usize) -> usize {
     bm.count_ones() as usize
   }
 
   // returns the bucket and item inds for data retrieval or placement
   #[inline(always)]
-  fn get_item_ind(bm: u64, bit_ind: usize) -> usize {
+  fn get_item_ind(bm: usize, bit_ind: usize) -> usize {
     if bit_ind == 0 {
       return 0;
     }
